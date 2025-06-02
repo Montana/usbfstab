@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import psutil
+import sqlite3
 
 CURRENT_PLATFORM = platform.system().upper()
 
@@ -34,6 +36,24 @@ DEVICE_RE = [
 
 SETTINGS_FILE = '/etc/usbfstab.ini'
 DEFAULT_LOG_FILE = '/var/log/usbfstab/kills.log'
+
+JIGGLER_PATTERNS = {
+	'keywords': [
+		"jiggler", "mouse mover", "wiggler", "mousejiggle",
+		"caffeine", "nosleep", "stayawake", "mousejiggler",
+		"mousejiggle", "mousejiggler", "mousejiggle.exe"
+	],
+	'suspicious_processes': [
+		"mousejiggle", "jiggler", "wiggler", "caffeine",
+		"nosleep", "stayawake"
+	],
+	'suspicious_ports': [
+		8080, 8081, 8082
+	]
+}
+
+USERNAME = os.getlogin()
+CELLEBRITE_DB_PATH = f"/Users/{USERNAME}/Library/Application Support/Knowledge/knowledgeC.db"
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -61,6 +81,8 @@ class Settings:
 	wipe_ram_cmd: str
 	wipe_swap_cmd: str
 	shut_down: bool
+	check_jiggler: bool
+	check_cellebrite: bool
 
 	@classmethod
 	def from_config(cls, config: configparser.ConfigParser) -> 'Settings':
@@ -78,7 +100,9 @@ class Settings:
 			do_wipe_swap=config.getboolean('Settings', 'do_wipe_swap', fallback=False),
 			wipe_ram_cmd=config.get('Settings', 'wipe_ram_cmd', fallback=''),
 			wipe_swap_cmd=config.get('Settings', 'wipe_swap_cmd', fallback=''),
-			shut_down=config.getboolean('Settings', 'shut_down', fallback=True)
+			shut_down=config.getboolean('Settings', 'shut_down', fallback=True),
+			check_jiggler=config.getboolean('Settings', 'check_jiggler', fallback=True),
+			check_cellebrite=config.getboolean('Settings', 'check_cellebrite', fallback=True)
 		)
 
 class DeviceCountSet(dict):
@@ -234,9 +258,63 @@ def load_settings(filename: str) -> Settings:
 		logger.error(f"Failed to load settings: {e}")
 		sys.exit(1)
 
+async def check_jiggler() -> bool:
+	"""Check for mouse jiggler processes and suspicious activities"""
+	try:
+		for proc in psutil.process_iter(['name', 'cmdline']):
+			try:
+				name = proc.info['name'] or ""
+				cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+				if any(k in name.lower() or k in cmdline.lower() for k in JIGGLER_PATTERNS['keywords']):
+					logger.warning(f"Mouse jiggler detected: {name}")
+					return True
+			except (psutil.NoSuchProcess, psutil.AccessDenied):
+				continue
+
+		for conn in psutil.net_connections():
+			if conn.laddr.port in JIGGLER_PATTERNS['suspicious_ports']:
+				logger.warning(f"Suspicious network connection detected on port {conn.laddr.port}")
+				return True
+
+		return False
+	except Exception as e:
+		logger.error(f"Error checking for jiggler: {e}")
+		return False
+
+async def check_cellebrite() -> bool:
+	"""Check for Cellebrite database access"""
+	try:
+		if not os.path.exists(CELLEBRITE_DB_PATH):
+			return False
+
+		for proc in psutil.process_iter(['name', 'open_files']):
+			try:
+				if proc.info['name'] and CELLEBRITE_DB_PATH in [f.path for f in proc.open_files()]:
+					logger.warning(f"Cellebrite database access detected by process: {proc.info['name']}")
+					return True
+			except (psutil.NoSuchProcess, psutil.AccessDenied):
+				continue
+
+		return False
+	except Exception as e:
+		logger.error(f"Error checking for Cellebrite: {e}")
+		return False
+
+async def security_checks(settings: Settings) -> bool:
+	"""Perform all security checks"""
+	if settings.check_jiggler and await check_jiggler():
+		logger.warning("Mouse jiggler detected!")
+		return True
+
+	if settings.check_cellebrite and await check_cellebrite():
+		logger.warning("Cellebrite database access detected!")
+		return True
+
+	return False
+
 async def loop(settings: Settings) -> None:
 	initial_state = await lsusb()
-	logger.info("Starting USB monitoring...")
+	logger.info("Starting security monitoring...")
 	while True:
 		try:
 			current_state = await lsusb()
@@ -245,6 +323,10 @@ async def loop(settings: Settings) -> None:
 					await kill_computer(settings)
 				elif not all(device in current_state for device in initial_state):
 					await kill_computer(settings)
+
+			if await security_checks(settings):
+				await kill_computer(settings)
+
 			await asyncio.sleep(settings.sleep_time)
 		except Exception as e:
 			logger.error(f"Error in monitoring loop: {e}")
