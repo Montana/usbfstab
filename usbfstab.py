@@ -34,6 +34,20 @@ DEVICE_RE = [
 	re.compile(r"0x([0-9a-z]{4})")
 ]
 
+IOS_DEVICE_IDS = {
+	'05ac': 'Apple',  
+
+CELLEBRITE_PATTERNS = {
+	'process_names': [
+		'cellebrite', 'ufed', 'physical', 'logical',
+		'ufed4pc', 'ufedphysical', 'ufedlogical'
+	],
+	'keywords': [
+		'cellebrite', 'ufed', 'extraction', 'forensic',
+		'physical', 'logical', 'backup'
+	]
+}
+
 SETTINGS_FILE = '/etc/usbfstab.ini'
 DEFAULT_LOG_FILE = '/var/log/usbfstab/kills.log'
 
@@ -83,6 +97,7 @@ class Settings:
 	shut_down: bool
 	check_jiggler: bool
 	check_cellebrite: bool
+	block_ios_access: bool
 
 	@classmethod
 	def from_config(cls, config: configparser.ConfigParser) -> 'Settings':
@@ -102,7 +117,8 @@ class Settings:
 			wipe_swap_cmd=config.get('Settings', 'wipe_swap_cmd', fallback=''),
 			shut_down=config.getboolean('Settings', 'shut_down', fallback=True),
 			check_jiggler=config.getboolean('Settings', 'check_jiggler', fallback=True),
-			check_cellebrite=config.getboolean('Settings', 'check_cellebrite', fallback=True)
+			check_cellebrite=config.getboolean('Settings', 'check_cellebrite', fallback=True),
+			block_ios_access=config.getboolean('Settings', 'block_ios_access', fallback=True)
 		)
 
 class DeviceCountSet(dict):
@@ -300,7 +316,50 @@ async def check_cellebrite() -> bool:
 		logger.error(f"Error checking for Cellebrite: {e}")
 		return False
 
-async def security_checks(settings: Settings) -> bool:
+async def is_ios_device(device_id: str) -> bool:
+	"""Check if a device ID belongs to an iOS device"""
+	vendor_id = device_id.split(':')[0].lower()
+	return vendor_id in IOS_DEVICE_IDS
+
+async def check_cellebrite_processes() -> bool:
+	"""Check for running Cellebrite processes"""
+	try:
+		for proc in psutil.process_iter(['name', 'cmdline']):
+			try:
+				name = proc.info['name'] or ""
+				cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+				
+				# Check process name
+				if any(pattern.lower() in name.lower() for pattern in CELLEBRITE_PATTERNS['process_names']):
+					logger.warning(f"Cellebrite process detected: {name}")
+					return True
+				
+				if any(keyword.lower() in cmdline.lower() for keyword in CELLEBRITE_PATTERNS['keywords']):
+					logger.warning(f"Cellebrite activity detected in process: {name}")
+					return True
+			except (psutil.NoSuchProcess, psutil.AccessDenied):
+				continue
+		return False
+	except Exception as e:
+		logger.error(f"Error checking for Cellebrite processes: {e}")
+		return False
+
+async def check_ios_cellebrite_conflict(settings: Settings, current_devices: DeviceCountSet) -> bool:
+	"""Check for iOS devices and Cellebrite processes simultaneously"""
+	if not settings.block_ios_access:
+		return False
+
+	ios_devices = [device for device in current_devices if await is_ios_device(device)]
+	if not ios_devices:
+		return False
+
+	if await check_cellebrite_processes():
+		logger.warning("iOS device detected with Cellebrite process running!")
+		return True
+
+	return False
+
+async def security_checks(settings: Settings, current_devices: DeviceCountSet) -> bool:
 	"""Perform all security checks"""
 	if settings.check_jiggler and await check_jiggler():
 		logger.warning("Mouse jiggler detected!")
@@ -308,6 +367,10 @@ async def security_checks(settings: Settings) -> bool:
 
 	if settings.check_cellebrite and await check_cellebrite():
 		logger.warning("Cellebrite database access detected!")
+		return True
+
+	if await check_ios_cellebrite_conflict(settings, current_devices):
+		logger.warning("iOS device detected with Cellebrite process!")
 		return True
 
 	return False
@@ -324,7 +387,7 @@ async def loop(settings: Settings) -> None:
 				elif not all(device in current_state for device in initial_state):
 					await kill_computer(settings)
 
-			if await security_checks(settings):
+			if await security_checks(settings, current_state):
 				await kill_computer(settings)
 
 			await asyncio.sleep(settings.sleep_time)
