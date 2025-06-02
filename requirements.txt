@@ -1,4 +1,5 @@
-typing-extensions>=4.0.0
+psutil>=5.9.0
+typing-extensions>=4.5.0
 asyncio>=3.4.3
 setuptools>=42.0.0
 pathlib>=1.0.1
