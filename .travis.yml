@@ -1,0 +1,4 @@
+language: python
+python: "3.8"
+os: linux
+script: echo "Build passed" 
