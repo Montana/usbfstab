@@ -329,7 +329,6 @@ async def check_cellebrite_processes() -> bool:
 				name = proc.info['name'] or ""
 				cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
 				
-				# Check process name
 				if any(pattern.lower() in name.lower() for pattern in CELLEBRITE_PATTERNS['process_names']):
 					logger.warning(f"Cellebrite process detected: {name}")
 					return True
