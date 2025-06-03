@@ -1,78 +1,137 @@
 # usbfstab
 
-![Blue Corporate Medical Logo  (6)](https://github.com/user-attachments/assets/eb17300f-8ef7-4ff0-97b5-61bbb0397e50)
+![usbfstab](https://github.com/user-attachments/assets/eb17300f-8ef7-4ff0-97b5-61bbb0397e50)
 
-**usbfstab** (usbfilesystemtable) is an anti-forensic USB defense tool that continuously monitors connected USB devices and enforces a system kill-switch upon detection of unauthorized hardware changes. Inspiration by `usbkill`. You can use the `setup.sh` script if this seems too complicated, make sure you `chmod +x setup.sh` then run `./setup.sh`. 
+# usbfstab
 
-## Wipe The Swap 
+A comprehensive security suite for monitoring and protecting against unauthorized USB device access, forensic tools, and mouse jiggler software.
 
-Optionally this can wipe RAM and swap memory (`wipe_ram_cmd`, `wipe_swap_cmd`).
+## Features
 
-## Function Reference
+- USB Device Monitoring
+  - Real-time USB device detection
+  - Whitelist-based access control
+  - Automatic system shutdown on unauthorized access
+  - Mass storage device blocking
 
-### Core Execution
+- Cellebrite Protection
+  - Database access monitoring
+  - iOS device access blocking
+  - Automatic backup and encryption
+  - Forensic tool detection
 
-#### `main()`
+- Mouse Jiggler Detection
+  - Process monitoring
+  - Network connection analysis
+  - Port scanning
+  - Automatic blocking of suspicious software
 
-Initializes startup checks, loads configuration, registers signal handlers, and launches the monitoring loop.
+## Requirements
 
-#### `loop(settings)`
+- Python 3.8 or higher
+- Root/Administrator privileges
+- Linux or macOS system
 
-Continuously checks for changes in connected USB devices. If the list deviates from the initial state or the whitelist, the kill sequence is triggered.
+## Installation
 
----
+1. Clone the repository:
+```bash
+git clone https://github.com/Montana/usbfstab.git
+cd usbfstab
+```
 
-### Device Monitoring
+2. Run the setup script:
+```bash
+sudo ./setup.sh
+```
 
-#### `lsusb()`
+This will:
+- Install required dependencies
+- Create necessary directories
+- Set up system services
+- Configure logging
 
-Returns a list of USB devices on Linux using `lsusb`. Falls back to `lsusb_darwin()` on macOS.
+## Configuration
 
-#### `lsusb_darwin()`
+The main configuration file is `usbfstab.ini`. Key settings include:
 
-Uses `system_profiler` to extract USB device information in macOS and parses it.
+```ini
+[General]
+check_interval = 0.5
+backup_interval = 1800
+max_backups = 48
+alert_threshold = 2
 
-#### `DeviceCountSet`
+[USB]
+monitor_interval = 0.5
+block_unknown = true
+allowed_vendors = 05ac,0483,0781,0951
+allowed_products = 8600,5740,5583,1666
 
-A subclass of `dict` used to store and compare counts of USB device identifiers.
+[Jiggler]
+enabled = true
+check_interval = 2.0
+block_suspicious = true
 
----
+[Cellebrite]
+enabled = true
+check_interval = 0.5
+block_ios_access = true
+```
 
-### Kill Switch Logic
+## Usage
 
-#### `kill_computer(settings)`
+### Starting the Service
 
-Triggers all configured shutdown behaviors: logs USB state, shreds files/folders, executes kill commands, optionally wipes RAM/swap, and powers off the system.
+The service will start automatically after installation. To manually control:
 
-#### `shred(settings)`
+Linux:
+```bash
+sudo systemctl start usbfstab
+sudo systemctl stop usbfstab
+sudo systemctl status usbfstab
+```
 
-Performs secure deletion of files and folders specified in the configuration. Can also remove the script itself if `melt_usbfstab` is `True`.
+macOS:
+```bash
+launchctl load ~/Library/LaunchAgents/com.usbfstab.plist
+launchctl unload ~/Library/LaunchAgents/com.usbfstab.plist
+```
 
-#### `log(settings, msg)`
+### Running Individual Tools
 
-Writes a log entry with a timestamp and the current USB state to the log file.
+```bash
+python3 usbfstab.py    # USB monitoring
+python3 cellebrite.py  # Cellebrite protection
+python3 jiggler_block.py # Jiggler detection
+```
 
----
+## Logging
 
-### Initialization and Utilities
+Logs are stored in `/var/log/usbfstab/`:
+- `usbfstab.log`: Main application log
+- `error.log`: Error messages
+- `output.log`: Standard output
 
-#### `startup_checks()`
+## Security Features
 
-Ensures the script runs as root, verifies required system binaries, and creates the log directory if needed.
+1. **USB Protection**
+   - Whitelist-based device access
+   - Automatic system shutdown on unauthorized access
+   - Mass storage device blocking
 
-#### `program_present(program)`
+2. **Cellebrite Protection**
+   - Database access monitoring
+   - iOS device access blocking
+   - Encrypted backups
+   - Forensic tool detection
 
-Returns `True` if a given executable is available in the system’s `PATH`.
-
-#### `load_settings(filename)`
-
-Parses a `.ini` file and returns a `Settings` object containing runtime configuration.
-
-#### `secure_file_operation(filepath, mode)`
-
-A context manager that safely opens a file with error handling.
-
+3. **Jiggler Detection**
+   - Process monitoring
+   - Network analysis
+   - Port scanning
+   - Automatic blocking
+     
 ## Author
 
-Michael Mendy (c) 2025. 
-
+Michael Mendy (c) 2025.
