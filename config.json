@@ -1,0 +1,9 @@
+{
+  "check_interval": 2.0,
+  "backup_interval": 1800,
+  "max_backups": 5,
+  "alert_threshold": 3,
+  "do_backup": true,
+  "do_monitor": true,
+  "do_cleanup": true
+}
