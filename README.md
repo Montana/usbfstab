@@ -4,7 +4,7 @@
 
 # usbfstab
 
-A comprehensive security suite for monitoring and protecting against unauthorized USB device access, forensic tools, and mouse jiggler software.
+`usbfstab` is a comprehensive security suite for monitoring and protecting against unauthorized USB device access, forensic tools, and mouse jiggler software.
 
 ## Features
 
