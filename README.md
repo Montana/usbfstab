@@ -4,6 +4,10 @@
 
 **usbfstab** (usbfilesystemtable) is an anti-forensic USB defense tool that continuously monitors connected USB devices and enforces a system kill-switch upon detection of unauthorized hardware changes. Inspiration by `usbkill`. You can use the `setup.sh` script if this seems too complicated, make sure you `chmod +x setup.sh` then run `./setup.sh`. 
 
+## Wipe The Swap 
+
+Optionally this can wipe RAM and swap memory (`wipe_ram_cmd`, `wipe_swap_cmd`).
+
 ## Function Reference
 
 ### Core Execution
