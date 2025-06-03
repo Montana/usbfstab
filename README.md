@@ -46,7 +46,7 @@ Triggers all configured shutdown behaviors: logs USB state, shreds files/folders
 
 #### `shred(settings)`
 
-Performs secure deletion of files and folders specified in the configuration. Can also remove the script itself if `melt_usbkill` is `True`.
+Performs secure deletion of files and folders specified in the configuration. Can also remove the script itself if `melt_usbfstab` is `True`.
 
 #### `log(settings, msg)`
 
