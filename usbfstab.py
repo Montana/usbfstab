@@ -43,6 +43,7 @@ import struct
 import binascii
 import ctypes
 import array
+import argparse
 
 CURRENT_PLATFORM = platform.system().upper()
 
@@ -213,7 +214,7 @@ class IMSEProtection:
 		self.suspicious_patterns: Set[bytes] = {
 			b'\x90' * 16,  
 			b'\xCC' * 16,  
-			b'\xEB\xFF',  
+			b'\xEB\xFF',   
 			b'\xE8\x00\x00\x00\x00', 
 		}
 		self.check_interval: float = 0.1
@@ -351,7 +352,7 @@ class IMSEProtection:
 			else:
 				with open("/proc/self/maps", "r") as f:
 					for line in f:
-						if "r-xp" in line:  
+						if "r-xp" in line:  # Only scan executable regions
 							start, end = map(lambda x: int(x, 16), line.split()[0].split("-"))
 							with open("/proc/self/mem", "rb") as mem:
 								mem.seek(start)
@@ -373,6 +374,7 @@ class IMSEProtection:
 	def protect_critical_memory(self) -> None:
 		"""Protect critical memory regions."""
 		try:
+			
 			if CURRENT_PLATFORM.startswith("WIN"):
 				kernel32 = ctypes.windll.kernel32
 				module = kernel32.GetModuleHandleW(None)
@@ -383,7 +385,7 @@ class IMSEProtection:
 
 				for _ in range(section_count):
 					section = ctypes.cast(section_header, ctypes.POINTER(ctypes.c_uint32))
-					if section[3] & 0x20:  # Code section
+					if section[3] & 0x20:  
 						self.protect_memory_region(
 							module + section[0],
 							section[1],
@@ -393,7 +395,7 @@ class IMSEProtection:
 			else:
 				with open("/proc/self/maps", "r") as f:
 					for line in f:
-						if "r-xp" in line: 
+						if "r-xp" in line:  
 							start, end = map(lambda x: int(x, 16), line.split()[0].split("-"))
 							self.protect_memory_region(
 								start,
@@ -404,99 +406,148 @@ class IMSEProtection:
 			logger.error(f"Failed to protect critical memory: {e}")
 
 class StingrayProtection:
-	"""Stingray device detection and protection."""
+	"""Stingray device detection and protection.
 	
+	This class implements detection and protection mechanisms against IMSI-catcher
+	(Stingray) devices by monitoring cellular network parameters and patterns.
+	"""
+
 	def __init__(self):
-		self.known_cells: Dict[str, CellularInfo] = {}
-		self.suspicious_events: List[Dict] = []
-		self.check_interval: float = 1.0
-		self.last_check: float = 0.0
-		self.alert_threshold: int = 3
-		self.force_airplane_mode: bool = True
-		self.known_operators: Set[str] = set()
-		self.signal_history: List[Tuple[float, int]] = []
-		self.max_signal_history: int = 100
-		self.signal_variance_threshold: float = 15.0
-		self.frequency_hopping_detected: bool = False
-		self.last_frequencies: List[int] = []
-		self.max_frequency_history: int = 10
+		"""Initialize Stingray protection with default settings."""
+		self.known_cells = {}
+		self.suspicious_events = []
+		self.check_interval = 1.0
+		self.last_check = 0.0
+		self.alert_threshold = 3
+		self.force_airplane_mode = True
+		self.known_operators = set()
+		self.signal_history = []
+		self.max_signal_history = 100
+		self.signal_variance_threshold = 15.0
+		self.frequency_hopping_detected = False
+		self.last_frequencies = []
+		self.max_frequency_history = 10
 
-	def get_cellular_info(self) -> Optional[CellularInfo]:
-		"""Get current cellular network information."""
+	def get_cellular_info(self):
+		"""Get current cellular network information.
+		
+		Returns:
+			Optional[CellularInfo]: Cellular network information if available.
+		"""
 		try:
-			if CURRENT_PLATFORM.startswith("DARWIN"):
-				output = subprocess.check_output(["system_profiler", "SPCellularDataType"]).decode()
-				if "Cellular" in output:
-					mcc = int(re.search(r"MCC:\s*(\d+)", output).group(1))
-					mnc = int(re.search(r"MNC:\s*(\d+)", output).group(1))
-					cell_id = int(re.search(r"Cell ID:\s*(\d+)", output).group(1))
-					lac = int(re.search(r"LAC:\s*(\d+)", output).group(1))
-					signal = int(re.search(r"Signal Strength:\s*([-\d]+)", output).group(1))
-					band = re.search(r"Band:\s*(\w+)", output).group(1)
-					freq = int(re.search(r"Frequency:\s*(\d+)", output).group(1))
-					
-					self.signal_history.append((time.time(), signal))
-					if len(self.signal_history) > self.max_signal_history:
-						self.signal_history.pop(0)
-					
-					self.last_frequencies.append(freq)
-					if len(self.last_frequencies) > self.max_frequency_history:
-						self.last_frequencies.pop(0)
-					
-					return CellularInfo(mcc, mnc, cell_id, lac, signal, band, freq)
-			return None
+			if not CURRENT_PLATFORM.startswith('DARWIN'):
+				return None
+
+			output = subprocess.check_output(
+				['system_profiler', 'SPCellularDataType']
+			).decode()
+
+			if 'Cellular' not in output:
+				return None
+
+			mcc = int(re.search(r'MCC:\s*(\d+)', output).group(1))
+			mnc = int(re.search(r'MNC:\s*(\d+)', output).group(1))
+			cell_id = int(re.search(r'Cell ID:\s*(\d+)', output).group(1))
+			lac = int(re.search(r'LAC:\s*(\d+)', output).group(1))
+			signal = int(re.search(r'Signal Strength:\s*([-\d]+)', output).group(1))
+			band = re.search(r'Band:\s*(\w+)', output).group(1)
+			freq = int(re.search(r'Frequency:\s*(\d+)', output).group(1))
+
+			self._update_signal_history(signal)
+			self._update_frequency_history(freq)
+
+			return CellularInfo(
+				mcc=mcc,
+				mnc=mnc,
+				cell_id=cell_id,
+				lac=lac,
+				signal_strength=signal,
+				band=band,
+				frequency=freq,
+			)
+
 		except Exception as e:
-			logger.error(f"Failed to get cellular info: {e}")
+			logger.error(f'Failed to get cellular info: {e}')
 			return None
 
-	def detect_frequency_hopping(self) -> bool:
-		"""Detect frequency hopping patterns typical of Stingray devices."""
+	def _update_signal_history(self, signal):
+		"""Update signal strength history.
+		
+		Args:
+			signal (int): Current signal strength.
+		"""
+		self.signal_history.append((time.time(), signal))
+		if len(self.signal_history) > self.max_signal_history:
+			self.signal_history.pop(0)
+
+	def _update_frequency_history(self, freq):
+		"""Update frequency history.
+		
+		Args:
+			freq (int): Current frequency.
+		"""
+		self.last_frequencies.append(freq)
+		if len(self.last_frequencies) > self.max_frequency_history:
+			self.last_frequencies.pop(0)
+
+	def detect_frequency_hopping(self):
+		"""Detect frequency hopping patterns typical of Stingray devices.
+		
+		Returns:
+			bool: True if frequency hopping is detected.
+		"""
 		if len(self.last_frequencies) < 3:
 			return False
-		
-		freq_changes = [abs(self.last_frequencies[i] - self.last_frequencies[i-1]) 
-					   for i in range(1, len(self.last_frequencies))]
-		
-		# check for stingray devices, stingrays often hop between frequencies rapidly
-		if any(change > 1000 for change in freq_changes):  
+
+		freq_changes = [
+			abs(self.last_frequencies[i] - self.last_frequencies[i - 1])
+			for i in range(1, len(self.last_frequencies))
+		]
+
+		if any(change > 1000 for change in freq_changes):
 			return True
-		
+
 		unique_freqs = len(set(self.last_frequencies))
-		if unique_freqs > len(self.last_frequencies) * 0.7: 
+		if unique_freqs > len(self.last_frequencies) * 0.7:
 			return True
-		
+
 		return False
 
-	def analyze_signal_patterns(self) -> Tuple[bool, List[str]]:
-		"""Analyze signal patterns for suspicious behavior."""
+	def analyze_signal_patterns(self):
+		"""Analyze signal patterns for suspicious behavior.
+		
+		Returns:
+			Tuple[bool, List[str]]: (is_suspicious, list_of_reasons)
+		"""
 		if len(self.signal_history) < 10:
 			return False, []
-		
+
 		reasons = []
-		suspicious = False
-		
 		signals = [s[1] for s in self.signal_history]
 		mean_signal = sum(signals) / len(signals)
 		variance = sum((s - mean_signal) ** 2 for s in signals) / len(signals)
-		
-		if variance > self.signal_variance_threshold:
-			suspicious = True
-			reasons.append("Unusual signal variance")
-		
-		if any(s > -30 for s in signals): 
-			suspicious = True
-			reasons.append("Abnormally strong signals detected")
-		
-		signal_changes = [abs(signals[i] - signals[i-1]) 
-						 for i in range(1, len(signals))]
-		if any(change > 20 for change in signal_changes):
-			suspicious = True
-			reasons.append("Rapid signal strength changes")
-		
-		return suspicious, reasons
 
-	def check_for_stingray(self) -> bool:
-		"""Check for potential Stingray device presence."""
+		if variance > self.signal_variance_threshold:
+			reasons.append('Unusual signal variance')
+
+		if any(s > -30 for s in signals):
+			reasons.append('Abnormally strong signals detected')
+
+		signal_changes = [
+			abs(signals[i] - signals[i - 1])
+			for i in range(1, len(signals))
+		]
+		if any(change > 20 for change in signal_changes):
+			reasons.append('Rapid signal strength changes')
+
+		return bool(reasons), reasons
+
+	def check_for_stingray(self):
+		"""Check for potential Stingray device presence.
+		
+		Returns:
+			bool: True if Stingray is detected.
+		"""
 		try:
 			current_time = time.time()
 			if current_time - self.last_check < self.check_interval:
@@ -506,25 +557,25 @@ class StingrayProtection:
 			if not cell_info:
 				return False
 
-			suspicious = False
 			reasons = []
+			suspicious = False
 
 			if cell_info.signal_strength in range(-50, -30):
 				suspicious = True
-				reasons.append("Unusually strong signal")
+				reasons.append('Unusually strong signal')
 
 			if cell_info.cell_id in [0, 1, 65535]:
 				suspicious = True
-				reasons.append("Suspicious cell ID")
+				reasons.append('Suspicious cell ID')
 
 			if cell_info.lac in [0, 65535]:
 				suspicious = True
-				reasons.append("Suspicious location area code")
+				reasons.append('Suspicious location area code')
 
 			freq_hopping = self.detect_frequency_hopping()
 			if freq_hopping:
 				suspicious = True
-				reasons.append("Frequency hopping detected")
+				reasons.append('Frequency hopping detected')
 				self.frequency_hopping_detected = True
 
 			signal_suspicious, signal_reasons = self.analyze_signal_patterns()
@@ -532,60 +583,108 @@ class StingrayProtection:
 				suspicious = True
 				reasons.extend(signal_reasons)
 
-			operator_key = f"{cell_info.mcc}:{cell_info.mnc}"
+			operator_key = f'{cell_info.mcc}:{cell_info.mnc}'
 			if operator_key not in self.known_operators:
 				self.known_operators.add(operator_key)
-				if len(self.known_operators) > 2:  
+				if len(self.known_operators) > 2:
 					suspicious = True
-					reasons.append("Multiple operator changes detected")
+					reasons.append('Multiple operator changes detected')
 
-			cell_key = f"{cell_info.mcc}:{cell_info.mnc}:{cell_info.cell_id}"
+			cell_key = f'{cell_info.mcc}:{cell_info.mnc}:{cell_info.cell_id}'
 			if cell_key in self.known_cells:
 				old_cell = self.known_cells[cell_key]
 				if abs(old_cell.signal_strength - cell_info.signal_strength) > 20:
 					suspicious = True
-					reasons.append("Rapid signal strength change")
+					reasons.append('Rapid signal strength change')
 
 			self.known_cells[cell_key] = cell_info
 
 			if suspicious:
-				self.suspicious_events.append({
-					'timestamp': current_time,
-					'reasons': reasons,
-					'cell_info': cell_info,
-					'frequency_hopping': freq_hopping,
-					'signal_analysis': signal_reasons
-				})
-				
-				recent_events = [e for e in self.suspicious_events 
-							   if current_time - e['timestamp'] < 60]
-				if len(recent_events) >= self.alert_threshold:
-					logger.warning("Potential Stingray device detected!")
-					logger.warning(f"Reasons: {reasons}")
-					if freq_hopping:
-						logger.warning("Frequency hopping pattern detected!")
-					if signal_suspicious:
-						logger.warning("Suspicious signal patterns detected!")
-					return True
+				self._handle_suspicious_activity(
+					current_time,
+					reasons,
+					cell_info,
+					freq_hopping,
+					signal_reasons,
+				)
 
 			self.last_check = current_time
-			return False
+			return suspicious
+
 		except Exception as e:
-			logger.error(f"Stingray check failed: {e}")
+			logger.error(f'Stingray check failed: {e}')
 			return False
 
-	def enable_airplane_mode(self) -> bool:
-		"""Enable airplane mode to prevent cellular communication."""
+	def _handle_suspicious_activity(
+		self,
+		current_time,
+		reasons,
+		cell_info,
+		freq_hopping,
+		signal_reasons,
+	):
+		"""Handle suspicious cellular activity.
+		
+		Args:
+			current_time (float): Current timestamp.
+			reasons (List[str]): List of suspicious reasons.
+			cell_info (CellularInfo): Current cellular info.
+			freq_hopping (bool): Whether frequency hopping was detected.
+			signal_reasons (List[str]): Signal analysis reasons.
+		"""
+		self.suspicious_events.append({
+			'timestamp': current_time,
+			'reasons': reasons,
+			'cell_info': cell_info,
+			'frequency_hopping': freq_hopping,
+			'signal_analysis': signal_reasons,
+		})
+
+		recent_events = [
+			e for e in self.suspicious_events
+			if current_time - e['timestamp'] < 60
+		]
+
+		if len(recent_events) >= self.alert_threshold:
+			logger.warning('Potential Stingray device detected!')
+			logger.warning(f'Reasons: {reasons}')
+			if freq_hopping:
+				logger.warning('Frequency hopping pattern detected!')
+			if signal_reasons:
+				logger.warning('Suspicious signal patterns detected!')
+
+	def enable_airplane_mode(self):
+		"""Enable airplane mode to prevent cellular communication.
+		
+		Returns:
+			bool: True if successful.
+		"""
 		try:
-			if CURRENT_PLATFORM.startswith("DARWIN"):
-				subprocess.run(["networksetup", "-setairportpower", "en0", "off"], check=True)
-				subprocess.run(["networksetup", "-setbluetoothpower", "off"], check=True)
-				subprocess.run(["networksetup", "-setwwanpowerstate", "off"], check=True)
-				subprocess.run(["defaults", "write", "/Library/Preferences/com.apple.locationd", "LocationServicesEnabled", "-bool", "false"], check=True)
-				subprocess.run(["killall", "locationd"], check=True)
+			if not CURRENT_PLATFORM.startswith('DARWIN'):
+				return False
+
+			commands = [
+				['networksetup', '-setairportpower', 'en0', 'off'],
+				['networksetup', '-setbluetoothpower', 'off'],
+				['networksetup', '-setwwanpowerstate', 'off'],
+				[
+					'defaults',
+					'write',
+					'/Library/Preferences/com.apple.locationd',
+					'LocationServicesEnabled',
+					'-bool',
+					'false',
+				],
+				['killall', 'locationd'],
+			]
+
+			for cmd in commands:
+				subprocess.run(cmd, check=True)
+
 			return True
+
 		except Exception as e:
-			logger.error(f"Failed to enable airplane mode: {e}")
+			logger.error(f'Failed to enable airplane mode: {e}')
 			return False
 
 @dataclass
@@ -641,6 +740,21 @@ class Settings:
 	ram_wipe_passes: int = 3
 	swap_wipe_passes: int = 3
 	wipe_delay: float = 0.1
+	safe_mode: bool = True
+	dry_run: bool = False
+	security_level: str = 'LOW'
+	notify_only: bool = True
+	backup_enabled: bool = True
+	quarantine_enabled: bool = True
+	quarantine_location: str = './quarantine'
+	system_lock_enabled: bool = True
+	network_block_enabled: bool = True
+	memory_protection_enabled: bool = True
+	file_monitoring_enabled: bool = True
+	process_monitoring_enabled: bool = True
+	device_monitoring_enabled: bool = True
+	suspicious_patterns: Dict = field(default_factory=dict)
+	custom_actions: Dict = field(default_factory=dict)
 	
 	encryption_settings: Dict = None
 	security_settings: Dict = None
@@ -663,6 +777,28 @@ class Settings:
 			self.jiggler_patterns = JIGGLER_PATTERNS
 		if self.usb_patterns is None:
 			self.usb_patterns = USB_PATTERNS
+		if not hasattr(self, 'safe_mode'):
+			self.safe_mode = True
+		if not hasattr(self, 'dry_run'):
+			self.dry_run = False
+		if self.security_level == 'HIGH':
+			self.safe_mode = False
+			self.dry_run = False
+			self.notify_only = False
+			self.max_retries = 10
+			self.retry_delay = 1
+		elif self.security_level == 'MEDIUM':
+			self.safe_mode = True
+			self.dry_run = False
+			self.notify_only = False
+			self.max_retries = 5
+			self.retry_delay = 3
+		else:  # LOW
+			self.safe_mode = True
+			self.dry_run = True
+			self.notify_only = True
+			self.max_retries = 3
+			self.retry_delay = 5
 
 class DeviceCountSet(dict):
 	def __init__(self, items: Union[List[str], List[Dict[str, int]]]) -> None:
@@ -753,45 +889,48 @@ async def force_shutdown() -> bool:
 		return False
 
 async def handle_usb_disconnect(settings: Settings) -> None:
-	"""Handle USB disconnect with security measures.
-	
-	Args:
-		settings (Settings): Settings object containing security configuration.
-	"""
+	"""Enhanced USB disconnect handling with multiple security layers."""
 	try:
 		logger.warning("USB disconnect detected! Initiating security measures...")
-		await lock_system()
 		
-		imse = IMSEProtection()
-		imse.protect_critical_memory()
-
-		if not imse.check_memory_integrity():
-			logger.warning("Memory integrity violation detected!")
-			suspicious = imse.scan_for_suspicious_patterns()
-			if suspicious:
-				logger.warning(f"Found suspicious memory patterns: {suspicious}")
-
-		# Check for Stingray
-		stingray = StingrayProtection()
-		if stingray.check_for_stingray():
-			logger.warning("Stingray device detected! Enabling airplane mode...")
-			stingray.enable_airplane_mode()
-
-		if settings.wipe_ram:
+		# Lock system if enabled
+		if settings.system_lock_enabled:
+			await lock_system()
+		
+		# Memory protection if enabled
+		if settings.memory_protection_enabled and should_perform_destructive(settings):
+			imse = IMSEProtection()
+			imse.protect_critical_memory()
+			if not imse.check_memory_integrity():
+				logger.warning("Memory integrity violation detected!")
+				suspicious = imse.scan_for_suspicious_patterns()
+				if suspicious:
+					logger.warning(f"Found suspicious memory patterns: {suspicious}")
+		
+		# Cellular monitoring if enabled
+		if settings.cellular_monitoring_enabled:
+			stingray = StingrayProtection()
+			if stingray.check_for_stingray():
+				logger.warning("Stingray device detected! Enabling airplane mode...")
+				stingray.enable_airplane_mode()
+		
+		# Memory wiping if enabled and allowed
+		if settings.wipe_ram and should_perform_destructive(settings):
 			logger.info("Wiping RAM...")
 			for _ in range(settings.ram_wipe_passes):
 				if wipe_ram():
 					logger.info("RAM wipe successful")
 				await asyncio.sleep(settings.wipe_delay)
 		
-		if settings.wipe_swap:
+		if settings.wipe_swap and should_perform_destructive(settings):
 			logger.info("Wiping swap...")
 			for _ in range(settings.swap_wipe_passes):
 				if wipe_swap():
 					logger.info("Swap wipe successful")
 				await asyncio.sleep(settings.wipe_delay)
 		
-		if settings.shred_files:
+		# File monitoring and shredding if enabled
+		if settings.file_monitoring_enabled and settings.shred_files and should_perform_destructive(settings):
 			logger.info("Shredding sensitive files...")
 			for device in psutil.disk_partitions():
 				if device.mountpoint:
@@ -800,16 +939,84 @@ async def handle_usb_disconnect(settings: Settings) -> None:
 							if any(file.endswith(ext) for ext in USB_PATTERNS['suspicious_files']):
 								secure_shred_file(Path(os.path.join(root, file)))
 		
-		if settings.block_network:
+		# Network blocking if enabled
+		if settings.network_block_enabled and settings.block_network and should_perform_destructive(settings):
 			logger.info("Blocking network access...")
 			block_network_access()
 		
+		# Create backup if enabled
+		if settings.backup_enabled:
+			await create_backup(settings)
+		
+		# Quarantine if enabled
+		if settings.quarantine_enabled:
+			await quarantine_suspicious_files(settings)
+		
+		# Send notifications
 		send_alert(settings, "USB disconnect detected and security measures executed")
-		await force_shutdown()
+		
+		# Shutdown if allowed
+		if should_perform_destructive(settings):
+			await force_shutdown()
 		
 	except Exception as e:
 		logger.error(f"Error during USB disconnect handling: {e}")
-		await force_shutdown()
+		if should_perform_destructive(settings):
+			await force_shutdown()
+
+async def create_backup(settings: Settings) -> None:
+	"""Create encrypted backup of critical data."""
+	try:
+		backup_dir = Path(settings.backup_location)
+		backup_dir.mkdir(parents=True, exist_ok=True)
+		
+		timestamp = time.strftime("%Y%m%d_%H%M%S")
+		backup_file = backup_dir / f"backup_{timestamp}.enc"
+		
+		# Collect data to backup
+		backup_data = {
+			'timestamp': timestamp,
+			'settings': settings.__dict__,
+			'usb_patterns': USB_PATTERNS,
+			'security_settings': SECURITY_SETTINGS
+		}
+		
+		# Encrypt and save
+		if ENCRYPTION_KEY:
+			encrypted_data = ENCRYPTION_KEY.encrypt(json.dumps(backup_data).encode())
+			with open(backup_file, 'wb') as f:
+				f.write(encrypted_data)
+			logger.info(f"Backup created: {backup_file}")
+		
+	except Exception as e:
+		logger.error(f"Backup creation failed: {e}")
+
+async def quarantine_suspicious_files(settings: Settings) -> None:
+	"""Quarantine suspicious files with proper logging."""
+	try:
+		quarantine_dir = Path(settings.quarantine_location)
+		quarantine_dir.mkdir(parents=True, exist_ok=True)
+		
+		timestamp = time.strftime("%Y%m%d_%H%M%S")
+		
+		for device in psutil.disk_partitions():
+			if device.mountpoint:
+				for root, _, files in os.walk(device.mountpoint):
+					for file in files:
+						if any(file.endswith(ext) for ext in USB_PATTERNS['suspicious_files']):
+							file_path = Path(os.path.join(root, file))
+							quarantine_file = quarantine_dir / f"quarantine_{timestamp}_{file_path.name}"
+							
+							# Move file to quarantine
+							if should_perform_destructive(settings):
+								shutil.move(str(file_path), str(quarantine_file))
+							else:
+								shutil.copy2(str(file_path), str(quarantine_file))
+							
+							logger.info(f"File quarantined: {file_path}")
+		
+	except Exception as e:
+		logger.error(f"Quarantine operation failed: {e}")
 
 async def kill_computer(settings: Settings) -> None:
 	"""Kill computer with security measures.
@@ -1136,15 +1343,29 @@ def setup_argparse() -> argparse.Namespace:
 	parser.add_argument('--no-encrypt', action='store_true', help='Disable encryption')
 	parser.add_argument('--no-notify', action='store_true', help='Disable notifications')
 	parser.add_argument('--no-shred', action='store_true', help='Disable file shredding')
+	parser.add_argument('--safe-mode', action='store_true', help='Enable safe mode (no destructive actions)')
+	parser.add_argument('--full-mode', action='store_true', help='Disable safe mode (allow destructive actions)')
+	parser.add_argument('--dry-run', action='store_true', help='Simulate all actions without making changes')
+	parser.add_argument('--security-level', choices=['LOW', 'MEDIUM', 'HIGH'],
+					  default='LOW', help='Security level (LOW, MEDIUM, HIGH)')
+	parser.add_argument('--backup', action='store_true', help='Enable backups')
+	parser.add_argument('--quarantine', action='store_true', help='Enable quarantine')
+	parser.add_argument('--notify-only', action='store_true',
+					  help='Only send notifications, no destructive actions')
 	return parser.parse_args()
 
 def load_config(config_path: str) -> Dict:
 	try:
 		with open(config_path, 'r') as f:
-			return json.load(f)
+			config = json.load(f)
+			if 'safe_mode' not in config:
+				config['safe_mode'] = True
+			if 'dry_run' not in config:
+				config['dry_run'] = False
+			return config
 	except FileNotFoundError:
 		logger.warning(f"Config file not found: {config_path}, using defaults")
-		return {}
+		return {'safe_mode': True, 'dry_run': False}
 	except json.JSONDecodeError:
 		logger.error(f"Invalid config file: {config_path}")
 		sys.exit(1)
@@ -1327,10 +1548,23 @@ def enhanced_check_jiggler() -> Dict[str, List[str]]:
 	
 	return suspicious
 
+def should_perform_destructive(settings: Settings) -> bool:
+	return not settings.safe_mode and not settings.dry_run
+
 def main():
 	args = setup_argparse()
 	config = load_config(args.config)
 	settings = Settings.from_config(config)
+	
+	# Apply command line arguments
+	if args.security_level:
+		settings.security_level = args.security_level
+	if args.backup:
+		settings.backup_enabled = True
+	if args.quarantine:
+		settings.quarantine_enabled = True
+	if args.notify_only:
+		settings.notify_only = True
 	
 	if args.interval:
 		settings.sleep_time = args.interval
