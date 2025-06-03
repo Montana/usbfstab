@@ -23,6 +23,24 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import psutil
 import sqlite3
+import json
+import hashlib
+import socket
+import threading
+import queue
+import ssl
+import requests
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import base64
+import secrets
+import tempfile
+import mmap
+import struct
+import binascii
 
 CURRENT_PLATFORM = platform.system().upper()
 
@@ -36,48 +54,130 @@ DEVICE_RE = [
 
 IOS_DEVICE_IDS = {
 	'05ac': 'Apple',  
+	'05ac:12a8': 'iPhone',
+	'05ac:12ab': 'iPad',
+	'05ac:12a9': 'iPod',
+	'05ac:12aa': 'Apple Watch',
+	'05ac:12ac': 'Apple TV'
+}
 
 CELLEBRITE_PATTERNS = {
 	'process_names': [
 		'cellebrite', 'ufed', 'physical', 'logical',
-		'ufed4pc', 'ufedphysical', 'ufedlogical'
+		'ufed4pc', 'ufedphysical', 'ufedlogical',
+		'ufedreader', 'ufed4pc', 'ufed4pc.exe',
+		'physicalanalyzer', 'logicalanalyzer',
+		'ufedphysicalanalyzer', 'ufedlogicalanalyzer'
 	],
 	'keywords': [
 		'cellebrite', 'ufed', 'extraction', 'forensic',
-		'physical', 'logical', 'backup'
+		'physical', 'logical', 'backup', 'analyzer',
+		'reader', 'extractor', 'forensics', 'evidence',
+		'investigation', 'acquisition', 'extraction'
+	],
+	'ports': [8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089],
+	'file_extensions': [
+		'.ufd', '.ufdr', '.ufdx', '.ufd4pc',
+		'.ufdphysical', '.ufdlogical', '.ufdreader',
+		'.ufdanalyzer', '.ufdbackup', '.ufdextraction'
+	],
+	'registry_keys': [
+		'SOFTWARE\\Cellebrite',
+		'SOFTWARE\\UFED',
+		'SOFTWARE\\Physical Analyzer',
+		'SOFTWARE\\Logical Analyzer'
 	]
 }
-
-SETTINGS_FILE = '/etc/usbfstab.ini'
-DEFAULT_LOG_FILE = '/var/log/usbfstab/kills.log'
 
 JIGGLER_PATTERNS = {
 	'keywords': [
 		"jiggler", "mouse mover", "wiggler", "mousejiggle",
 		"caffeine", "nosleep", "stayawake", "mousejiggler",
-		"mousejiggle", "mousejiggler", "mousejiggle.exe"
+		"mousejiggle", "mousejiggler", "mousejiggle.exe",
+		"jiggler.exe", "wiggler.exe", "caffeine.exe",
+		"nosleep.exe", "stayawake.exe"
 	],
 	'suspicious_processes': [
 		"mousejiggle", "jiggler", "wiggler", "caffeine",
-		"nosleep", "stayawake"
+		"nosleep", "stayawake", "jiggler.exe", "wiggler.exe",
+		"caffeine.exe", "nosleep.exe", "stayawake.exe"
 	],
-	'suspicious_ports': [
-		8080, 8081, 8082
+	'suspicious_ports': [8080, 8081, 8082, 8083, 8084, 8085],
+	'file_extensions': [
+		'.exe', '.dll', '.sys', '.bat', '.cmd', '.ps1',
+		'.vbs', '.js', '.wsf', '.msi', '.inf', '.reg'
+	],
+	'registry_keys': [
+		'SOFTWARE\\MouseJiggle',
+		'SOFTWARE\\Jiggler',
+		'SOFTWARE\\Wiggler',
+		'SOFTWARE\\Caffeine',
+		'SOFTWARE\\NoSleep',
+		'SOFTWARE\\StayAwake'
 	]
 }
+
+USB_PATTERNS = {
+	'blocked_vendors': {
+		'05ac', '0483', '0781', '0951', '0bda', '0cf3',
+		'04f3', '046d', '045e', '0461', '0451', '0457',
+		'04e8', '04b4', '04b3', '04b0', '04a9', '04a5'
+	},
+	'blocked_products': {
+		'8600', '5740', '5583', '1666', '8176', '8179',
+		'8178', '8177', '8176', '8175', '8174', '8173',
+		'8172', '8171', '8170', '8169', '8168', '8167'
+	},
+	'suspicious_ports': {8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089},
+	'suspicious_files': {
+		'.exe', '.dll', '.sys', '.bat', '.cmd', '.ps1',
+		'.vbs', '.js', '.wsf', '.msi', '.inf', '.reg',
+		'.ufd', '.ufdr', '.ufdx', '.ufd4pc', '.ufdphysical',
+		'.ufdlogical', '.ufdreader', '.ufdanalyzer', '.ufdbackup'
+	}
+}
+
+ENCRYPTION_SETTINGS = {
+	'salt_length': 16,
+	'key_length': 32,
+	'iterations': 100000,
+	'algorithm': 'AES-256-GCM',
+	'tag_length': 16,
+	'nonce_length': 12
+}
+
+SECURITY_SETTINGS = {
+	'max_retries': 3,
+	'retry_delay': 5,
+	'alert_threshold': 2,
+	'backup_interval': 1800,
+	'max_backups': 48,
+	'check_interval': 0.5,
+	'shred_passes': 3,
+	'encryption_enabled': True,
+	'network_blocking': True,
+	'file_shredding': True,
+	'process_killing': True,
+	'registry_monitoring': True
+}
+
+SETTINGS_FILE = '/etc/usbfstab.ini'
+DEFAULT_LOG_FILE = '/var/log/usbfstab/kills.log'
 
 USERNAME = os.getlogin()
 CELLEBRITE_DB_PATH = f"/Users/{USERNAME}/Library/Application Support/Knowledge/knowledgeC.db"
 
 logging.basicConfig(
-	level=logging.INFO,
+	level=logging.DEBUG,
 	format='%(asctime)s - %(levelname)s - %(message)s',
 	handlers=[
-		logging.FileHandler(DEFAULT_LOG_FILE),
-		logging.StreamHandler()
+		logging.FileHandler('/var/log/usbfstab/usbfstab.log'),
+		logging.StreamHandler(sys.stdout)
 	]
 )
 logger = logging.getLogger(__name__)
+
+ENCRYPTION_KEY = Fernet.generate_key()
 
 @dataclass
 class Settings:
@@ -98,28 +198,45 @@ class Settings:
 	check_jiggler: bool
 	check_cellebrite: bool
 	block_ios_access: bool
-
-	@classmethod
-	def from_config(cls, config: configparser.ConfigParser) -> 'Settings':
-		return cls(
-			sleep_time=config.getfloat('Settings', 'sleep_time', fallback=0.25),
-			whitelist=set(config.get('Settings', 'whitelist', fallback='').split()),
-			log_file=config.get('Settings', 'log_file', fallback=DEFAULT_LOG_FILE),
-			remove_file_cmd=config.get('Settings', 'remove_file_cmd', fallback='shred -u -z -n 1 '),
-			melt_usbkill=config.getboolean('Settings', 'melt_usbkill', fallback=False),
-			folders_to_remove=config.get('Settings', 'folders_to_remove', fallback='').split(),
-			files_to_remove=config.get('Settings', 'files_to_remove', fallback='').split(),
-			kill_commands=config.get('Settings', 'kill_commands', fallback='').split(),
-			do_sync=config.getboolean('Settings', 'do_sync', fallback=True),
-			do_wipe_ram=config.getboolean('Settings', 'do_wipe_ram', fallback=False),
-			do_wipe_swap=config.getboolean('Settings', 'do_wipe_swap', fallback=False),
-			wipe_ram_cmd=config.get('Settings', 'wipe_ram_cmd', fallback=''),
-			wipe_swap_cmd=config.get('Settings', 'wipe_swap_cmd', fallback=''),
-			shut_down=config.getboolean('Settings', 'shut_down', fallback=True),
-			check_jiggler=config.getboolean('Settings', 'check_jiggler', fallback=True),
-			check_cellebrite=config.getboolean('Settings', 'check_cellebrite', fallback=True),
-			block_ios_access=config.getboolean('Settings', 'block_ios_access', fallback=True)
-		)
+	check_interval: float = 0.5
+	backup_interval: int = 1800
+	max_backups: int = 48
+	alert_threshold: int = 2
+	do_backup: bool = True
+	do_monitor: bool = True
+	do_cleanup: bool = True
+	backup_location: str = '/var/backups/usbfstab'
+	encrypt_backups: bool = True
+	notify_email: bool = True
+	notify_api: bool = True
+	shred_files: bool = True
+	block_network: bool = True
+	max_retries: int = 3
+	retry_delay: int = 5
+	allowed_vendors: Set[str] = None
+	allowed_products: Set[str] = None
+	
+	encryption_settings: Dict = None
+	security_settings: Dict = None
+	cellebrite_patterns: Dict = None
+	jiggler_patterns: Dict = None
+	usb_patterns: Dict = None
+	
+	def __post_init__(self):
+		if self.allowed_vendors is None:
+			self.allowed_vendors = set()
+		if self.allowed_products is None:
+			self.allowed_products = set()
+		if self.encryption_settings is None:
+			self.encryption_settings = ENCRYPTION_SETTINGS
+		if self.security_settings is None:
+			self.security_settings = SECURITY_SETTINGS
+		if self.cellebrite_patterns is None:
+			self.cellebrite_patterns = CELLEBRITE_PATTERNS
+		if self.jiggler_patterns is None:
+			self.jiggler_patterns = JIGGLER_PATTERNS
+		if self.usb_patterns is None:
+			self.usb_patterns = USB_PATTERNS
 
 class DeviceCountSet(dict):
 	def __init__(self, items: Union[List[str], List[Dict[str, int]]]) -> None:
@@ -359,20 +476,28 @@ async def check_ios_cellebrite_conflict(settings: Settings, current_devices: Dev
 	return False
 
 async def security_checks(settings: Settings, current_devices: DeviceCountSet) -> bool:
-	"""Perform all security checks"""
-	if settings.check_jiggler and await check_jiggler():
-		logger.warning("Mouse jiggler detected!")
+	"""Perform all security checks with enhanced detection"""
+	try:
+		cellebrite_suspicious = enhanced_check_cellebrite()
+		if any(cellebrite_suspicious.values()):
+			logger.warning("Cellebrite activity detected!")
+			logger.warning(f"Cellebrite suspicious activities: {cellebrite_suspicious}")
+			return True
+		
+		jiggler_suspicious = enhanced_check_jiggler()
+		if any(jiggler_suspicious.values()):
+			logger.warning("Jiggler activity detected!")
+			logger.warning(f"Jiggler suspicious activities: {jiggler_suspicious}")
+			return True
+		
+		if await check_ios_cellebrite_conflict(settings, current_devices):
+			logger.warning("iOS device detected with Cellebrite process!")
+			return True
+		
+		return False
+	except Exception as e:
+		logger.error(f"Security checks failed: {e}")
 		return True
-
-	if settings.check_cellebrite and await check_cellebrite():
-		logger.warning("Cellebrite database access detected!")
-		return True
-
-	if await check_ios_cellebrite_conflict(settings, current_devices):
-		logger.warning("iOS device detected with Cellebrite process!")
-		return True
-
-	return False
 
 async def loop(settings: Settings) -> None:
 	initial_state = await lsusb()
@@ -421,5 +546,249 @@ async def main() -> None:
 	signal.signal(signal.SIGTERM, exit_handler)
 	await loop(settings)
 
+def setup_argparse() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description='USB Security Monitoring Tool')
+	parser.add_argument('--config', type=str, help='Path to config file')
+	parser.add_argument('--no-backup', action='store_true', help='Disable backups')
+	parser.add_argument('--no-monitor', action='store_true', help='Disable monitoring')
+	parser.add_argument('--interval', type=float, help='Check interval in seconds')
+	parser.add_argument('--no-encrypt', action='store_true', help='Disable encryption')
+	parser.add_argument('--no-notify', action='store_true', help='Disable notifications')
+	parser.add_argument('--no-shred', action='store_true', help='Disable file shredding')
+	return parser.parse_args()
+
+def load_config(config_path: str) -> Dict:
+	try:
+		with open(config_path, 'r') as f:
+			return json.load(f)
+	except FileNotFoundError:
+		logger.warning(f"Config file not found: {config_path}, using defaults")
+		return {}
+	except json.JSONDecodeError:
+		logger.error(f"Invalid config file: {config_path}")
+		sys.exit(1)
+
+def generate_encryption_key(password: str, salt: bytes = None) -> tuple[bytes, bytes]:
+	if salt is None:
+		salt = secrets.token_bytes(ENCRYPTION_SETTINGS['salt_length'])
+	kdf = PBKDF2HMAC(
+		algorithm=hashes.SHA256(),
+		length=ENCRYPTION_SETTINGS['key_length'],
+		salt=salt,
+		iterations=ENCRYPTION_SETTINGS['iterations'],
+		backend=default_backend()
+	)
+	key = kdf.derive(password.encode())
+	return key, salt
+
+def encrypt_data(data: bytes, key: bytes) -> tuple[bytes, bytes, bytes]:
+	nonce = secrets.token_bytes(ENCRYPTION_SETTINGS['nonce_length'])
+	cipher = Cipher(
+		algorithms.AES(key),
+		modes.GCM(nonce),
+		backend=default_backend()
+	)
+	encryptor = cipher.encryptor()
+	ciphertext = encryptor.update(data) + encryptor.finalize()
+	return ciphertext, nonce, encryptor.tag
+
+def decrypt_data(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes) -> bytes:
+	cipher = Cipher(
+		algorithms.AES(key),
+		modes.GCM(nonce, tag),
+		backend=default_backend()
+	)
+	decryptor = cipher.decryptor()
+	return decryptor.update(ciphertext) + decryptor.finalize()
+
+def secure_encrypt_file(file_path: Path, password: str) -> bool:
+	try:
+		with open(file_path, 'rb') as f:
+			data = f.read()
+		
+		key, salt = generate_encryption_key(password)
+		ciphertext, nonce, tag = encrypt_data(data, key)
+		
+		with open(file_path, 'wb') as f:
+			f.write(salt + nonce + tag + ciphertext)
+		return True
+	except Exception as e:
+		logger.error(f"Secure encryption failed: {e}")
+		return False
+
+def secure_decrypt_file(file_path: Path, password: str) -> bool:
+	try:
+		with open(file_path, 'rb') as f:
+			data = f.read()
+		
+		salt = data[:ENCRYPTION_SETTINGS['salt_length']]
+		nonce = data[ENCRYPTION_SETTINGS['salt_length']:ENCRYPTION_SETTINGS['salt_length'] + ENCRYPTION_SETTINGS['nonce_length']]
+		tag = data[ENCRYPTION_SETTINGS['salt_length'] + ENCRYPTION_SETTINGS['nonce_length']:ENCRYPTION_SETTINGS['salt_length'] + ENCRYPTION_SETTINGS['nonce_length'] + ENCRYPTION_SETTINGS['tag_length']]
+		ciphertext = data[ENCRYPTION_SETTINGS['salt_length'] + ENCRYPTION_SETTINGS['nonce_length'] + ENCRYPTION_SETTINGS['tag_length']:]
+		
+		key, _ = generate_encryption_key(password, salt)
+		decrypted_data = decrypt_data(ciphertext, key, nonce, tag)
+		
+		with open(file_path, 'wb') as f:
+			f.write(decrypted_data)
+		return True
+	except Exception as e:
+		logger.error(f"Secure decryption failed: {e}")
+		return False
+
+def secure_shred_file(file_path: Path) -> bool:
+	try:
+		if not file_path.exists():
+			return True
+		
+		file_size = file_path.stat().st_size
+		with open(file_path, 'r+b') as f:
+
+			mm = mmap.mmap(f.fileno(), 0)
+			
+			for _ in range(SECURITY_SETTINGS['shred_passes']):
+				mm.seek(0)
+				mm.write(os.urandom(file_size))
+			
+			mm.seek(0)
+			mm.write(b'\x00' * file_size)
+			
+			mm.seek(0)
+			mm.write(b'\xFF' * file_size)
+			
+			mm.close()
+		
+		file_path.unlink()
+		return True
+	except Exception as e:
+		logger.error(f"Secure shredding failed: {e}")
+		return False
+
+def check_registry_keys(patterns: Dict) -> List[str]:
+	suspicious = []
+	if CURRENT_PLATFORM.startswith("WIN"):
+		try:
+			for key in patterns.get('registry_keys', []):
+				result = subprocess.run(['reg', 'query', key], capture_output=True, text=True)
+				if result.returncode == 0:
+					suspicious.append(f"Found registry key: {key}")
+		except Exception as e:
+			logger.error(f"Registry check failed: {e}")
+	return suspicious
+
+def enhanced_check_cellebrite() -> Dict[str, List[str]]:
+	suspicious = {
+		'processes': [],
+		'files': [],
+		'ports': [],
+		'registry': []
+	}
+	
+	try:
+		for proc in psutil.process_iter(['name', 'cmdline', 'open_files']):
+			try:
+				name = proc.info['name'] or ""
+				cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+				
+				if any(pattern.lower() in name.lower() for pattern in CELLEBRITE_PATTERNS['process_names']):
+					suspicious['processes'].append(f"Cellebrite process: {name}")
+				
+				if any(keyword.lower() in cmdline.lower() for keyword in CELLEBRITE_PATTERNS['keywords']):
+					suspicious['processes'].append(f"Cellebrite activity in process: {name}")
+				
+				for file in proc.info['open_files']:
+					if any(ext in file.path.lower() for ext in CELLEBRITE_PATTERNS['file_extensions']):
+						suspicious['files'].append(f"Cellebrite file access: {file.path}")
+			except (psutil.NoSuchProcess, psutil.AccessDenied):
+				continue
+		
+		for conn in psutil.net_connections():
+			if conn.laddr.port in CELLEBRITE_PATTERNS['ports']:
+				suspicious['ports'].append(f"Cellebrite port: {conn.laddr.port}")
+		
+		suspicious['registry'] = check_registry_keys(CELLEBRITE_PATTERNS)
+		
+	except Exception as e:
+		logger.error(f"Enhanced Cellebrite check failed: {e}")
+	
+	return suspicious
+
+def enhanced_check_jiggler() -> Dict[str, List[str]]:
+	suspicious = {
+		'processes': [],
+		'files': [],
+		'ports': [],
+		'registry': []
+	}
+	
+	try:
+		for proc in psutil.process_iter(['name', 'cmdline']):
+			try:
+				name = proc.info['name'] or ""
+				cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+				
+				if any(pattern.lower() in name.lower() for pattern in JIGGLER_PATTERNS['suspicious_processes']):
+					suspicious['processes'].append(f"Jiggler process: {name}")
+				
+				if any(keyword.lower() in cmdline.lower() for keyword in JIGGLER_PATTERNS['keywords']):
+					suspicious['processes'].append(f"Jiggler activity in process: {name}")
+			except (psutil.NoSuchProcess, psutil.AccessDenied):
+				continue
+		
+		for conn in psutil.net_connections():
+			if conn.laddr.port in JIGGLER_PATTERNS['suspicious_ports']:
+				suspicious['ports'].append(f"Jiggler port: {conn.laddr.port}")
+		
+		suspicious['registry'] = check_registry_keys(JIGGLER_PATTERNS)
+		
+	except Exception as e:
+		logger.error(f"Enhanced jiggler check failed: {e}")
+	
+	return suspicious
+
+def main():
+	args = setup_argparse()
+	config = load_config(args.config)
+	settings = Settings.from_config(config)
+	
+	if args.interval:
+		settings.check_interval = args.interval
+	if args.no_backup:
+		settings.do_backup = False
+	if args.no_monitor:
+		settings.do_monitor = False
+	if args.no_encrypt:
+		settings.encrypt_backups = False
+	if args.no_notify:
+		settings.notify_email = False
+		settings.notify_api = False
+	if args.no_shred:
+		settings.shred_files = False
+	
+	logger.info("Starting USB security monitoring...")
+	
+	try:
+		while True:
+			if settings.do_monitor:
+				suspicious_devices = check_usb_devices()
+				suspicious_connections = check_network_connections()
+				
+				if (suspicious_devices['devices'] or 
+					suspicious_devices['files'] or 
+					suspicious_connections):
+					logger.warning("Suspicious activity detected!")
+					logger.warning(f"Devices: {suspicious_devices['devices']}")
+					logger.warning(f"Files: {suspicious_devices['files']}")
+					logger.warning(f"Connections: {suspicious_connections}")
+					handle_security_breach(settings)
+			
+			time.sleep(settings.check_interval)
+			
+	except KeyboardInterrupt:
+		logger.info("Monitoring stopped by user")
+	except Exception as e:
+		logger.error(f"Unexpected error: {e}")
+		sys.exit(1)
+
 if __name__ == "__main__":
-	asyncio.run(main())
+	main()
