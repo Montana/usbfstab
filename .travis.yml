@@ -1,4 +1,3 @@
-language: python
-python: "3.8"
+language: generic
 os: linux
 script: echo "Build passed" 
