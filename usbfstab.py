@@ -16,8 +16,8 @@ import shutil
 from pathlib import Path
 from time import sleep
 from datetime import datetime
-from typing import Dict, List, Set, Optional, Union, Any
-from dataclasses import dataclass
+from typing import Dict, List, Set, Optional, Union, Any, Tuple
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -181,6 +181,425 @@ logger = logging.getLogger(__name__)
 
 ENCRYPTION_KEY = Fernet.generate_key()
 
+MEMORY_PROTECTION = {
+	'PAGE_EXECUTE': 0x10,
+	'PAGE_EXECUTE_READ': 0x20,
+	'PAGE_EXECUTE_READWRITE': 0x40,
+	'PAGE_EXECUTE_WRITECOPY': 0x80,
+	'PAGE_NOACCESS': 0x01,
+	'PAGE_READONLY': 0x02,
+	'PAGE_READWRITE': 0x04,
+	'PAGE_WRITECOPY': 0x08,
+	'PAGE_GUARD': 0x100,
+	'PAGE_NOCACHE': 0x200,
+	'PAGE_WRITECOMBINE': 0x400
+}
+
+@dataclass
+class MemoryRegion:
+	"""Represents a protected memory region."""
+	start: int
+	size: int
+	protection: int
+	hash: str = field(default='')
+	last_check: float = field(default=0.0)
+
+class IMSEProtection:
+	"""IMSE attack protection and monitoring."""
+	
+	def __init__(self):
+		self.protected_regions: List[MemoryRegion] = []
+		self.memory_hashes: Dict[int, str] = {}
+		self.suspicious_patterns: Set[bytes] = {
+			b'\x90' * 16,  
+			b'\xCC' * 16,  
+			b'\xEB\xFF',  
+			b'\xE8\x00\x00\x00\x00', 
+		}
+		self.check_interval: float = 0.1
+		self.last_check: float = 0.0
+
+	def protect_memory_region(self, start: int, size: int, protection: int) -> bool:
+		"""Protect a memory region from modification.
+		
+		Args:
+			start (int): Start address of memory region
+			size (int): Size of memory region
+			protection (int): Protection flags
+			
+		Returns:
+			bool: True if protection was successful
+		"""
+		try:
+			if CURRENT_PLATFORM.startswith("WIN"):
+				kernel32 = ctypes.windll.kernel32
+				old_protect = ctypes.c_ulong(0)
+				result = kernel32.VirtualProtect(
+					ctypes.c_void_p(start),
+					ctypes.c_size_t(size),
+					protection,
+					ctypes.byref(old_protect)
+				)
+				if result:
+					region = MemoryRegion(start, size, protection)
+					region.hash = self._calculate_region_hash(start, size)
+					self.protected_regions.append(region)
+					return True
+			else:
+				# Linux/macOS memory protection
+				libc = ctypes.CDLL('libc.so.6')
+				result = libc.mprotect(
+					ctypes.c_void_p(start),
+					ctypes.c_size_t(size),
+					protection
+				)
+				if result == 0:
+					region = MemoryRegion(start, size, protection)
+					region.hash = self._calculate_region_hash(start, size)
+					self.protected_regions.append(region)
+					return True
+			return False
+		except Exception as e:
+			logger.error(f"Failed to protect memory region: {e}")
+			return False
+
+	def _calculate_region_hash(self, start: int, size: int) -> str:
+		"""Calculate hash of memory region for integrity checking.
+		
+		Args:
+			start (int): Start address
+			size (int): Size of region
+			
+		Returns:
+			str: SHA-256 hash of memory region
+		"""
+		try:
+			if CURRENT_PLATFORM.startswith("WIN"):
+				kernel32 = ctypes.windll.kernel32
+				buffer = (ctypes.c_char * size)()
+				bytes_read = ctypes.c_size_t(0)
+				kernel32.ReadProcessMemory(
+					kernel32.GetCurrentProcess(),
+					ctypes.c_void_p(start),
+					buffer,
+					size,
+					ctypes.byref(bytes_read)
+				)
+			else:
+				with open(f"/proc/self/mem", "rb") as f:
+					f.seek(start)
+					buffer = f.read(size)
+			
+			return hashlib.sha256(buffer).hexdigest()
+		except Exception as e:
+			logger.error(f"Failed to calculate memory hash: {e}")
+			return ""
+
+	def check_memory_integrity(self) -> bool:
+		"""Check integrity of protected memory regions.
+		
+		Returns:
+			bool: True if all regions are intact
+		"""
+		try:
+			current_time = time.time()
+			if current_time - self.last_check < self.check_interval:
+				return True
+
+			for region in self.protected_regions:
+				current_hash = self._calculate_region_hash(region.start, region.size)
+				if current_hash != region.hash:
+					logger.warning(f"Memory integrity violation detected at {hex(region.start)}")
+					return False
+				region.last_check = current_time
+
+			self.last_check = current_time
+			return True
+		except Exception as e:
+			logger.error(f"Memory integrity check failed: {e}")
+			return False
+
+	def scan_for_suspicious_patterns(self) -> List[Tuple[int, bytes]]:
+		"""Scan memory for suspicious patterns.
+		
+		Returns:
+			List[Tuple[int, bytes]]: List of (address, pattern) tuples
+		"""
+		suspicious_found = []
+		try:
+			if CURRENT_PLATFORM.startswith("WIN"):
+				kernel32 = ctypes.windll.kernel32
+				process = kernel32.GetCurrentProcess()
+				address = 0
+				while address < 0x7FFFFFFF:
+					try:
+						buffer = (ctypes.c_char * 4096)()
+						bytes_read = ctypes.c_size_t(0)
+						if kernel32.ReadProcessMemory(
+							process,
+							ctypes.c_void_p(address),
+							buffer,
+							4096,
+							ctypes.byref(bytes_read)
+						):
+							for pattern in self.suspicious_patterns:
+								if pattern in buffer:
+									suspicious_found.append((address + buffer.index(pattern), pattern))
+					except:
+						pass
+					address += 4096
+			else:
+				with open("/proc/self/maps", "r") as f:
+					for line in f:
+						if "r-xp" in line:  
+							start, end = map(lambda x: int(x, 16), line.split()[0].split("-"))
+							with open("/proc/self/mem", "rb") as mem:
+								mem.seek(start)
+								data = mem.read(end - start)
+								for pattern in self.suspicious_patterns:
+									pos = 0
+									while True:
+										pos = data.find(pattern, pos)
+										if pos == -1:
+											break
+										suspicious_found.append((start + pos, pattern))
+										pos += 1
+
+			return suspicious_found
+		except Exception as e:
+			logger.error(f"Memory pattern scan failed: {e}")
+			return []
+
+	def protect_critical_memory(self) -> None:
+		"""Protect critical memory regions."""
+		try:
+			if CURRENT_PLATFORM.startswith("WIN"):
+				kernel32 = ctypes.windll.kernel32
+				module = kernel32.GetModuleHandleW(None)
+				dos_header = ctypes.cast(module, ctypes.POINTER(ctypes.c_uint32))[0]
+				pe_header = module + dos_header
+				section_count = ctypes.cast(pe_header + 6, ctypes.POINTER(ctypes.c_uint16))[0]
+				section_header = pe_header + 0xF8
+
+				for _ in range(section_count):
+					section = ctypes.cast(section_header, ctypes.POINTER(ctypes.c_uint32))
+					if section[3] & 0x20:  # Code section
+						self.protect_memory_region(
+							module + section[0],
+							section[1],
+							MEMORY_PROTECTION['PAGE_EXECUTE_READ']
+						)
+					section_header += 40
+			else:
+				with open("/proc/self/maps", "r") as f:
+					for line in f:
+						if "r-xp" in line: 
+							start, end = map(lambda x: int(x, 16), line.split()[0].split("-"))
+							self.protect_memory_region(
+								start,
+								end - start,
+								MEMORY_PROTECTION['PAGE_EXECUTE_READ']
+							)
+		except Exception as e:
+			logger.error(f"Failed to protect critical memory: {e}")
+
+class StingrayProtection:
+	"""Stingray device detection and protection."""
+	
+	def __init__(self):
+		self.known_cells: Dict[str, CellularInfo] = {}
+		self.suspicious_events: List[Dict] = []
+		self.check_interval: float = 1.0
+		self.last_check: float = 0.0
+		self.alert_threshold: int = 3
+		self.force_airplane_mode: bool = True
+		self.known_operators: Set[str] = set()
+		self.signal_history: List[Tuple[float, int]] = []
+		self.max_signal_history: int = 100
+		self.signal_variance_threshold: float = 15.0
+		self.frequency_hopping_detected: bool = False
+		self.last_frequencies: List[int] = []
+		self.max_frequency_history: int = 10
+
+	def get_cellular_info(self) -> Optional[CellularInfo]:
+		"""Get current cellular network information."""
+		try:
+			if CURRENT_PLATFORM.startswith("DARWIN"):
+				output = subprocess.check_output(["system_profiler", "SPCellularDataType"]).decode()
+				if "Cellular" in output:
+					mcc = int(re.search(r"MCC:\s*(\d+)", output).group(1))
+					mnc = int(re.search(r"MNC:\s*(\d+)", output).group(1))
+					cell_id = int(re.search(r"Cell ID:\s*(\d+)", output).group(1))
+					lac = int(re.search(r"LAC:\s*(\d+)", output).group(1))
+					signal = int(re.search(r"Signal Strength:\s*([-\d]+)", output).group(1))
+					band = re.search(r"Band:\s*(\w+)", output).group(1)
+					freq = int(re.search(r"Frequency:\s*(\d+)", output).group(1))
+					
+					self.signal_history.append((time.time(), signal))
+					if len(self.signal_history) > self.max_signal_history:
+						self.signal_history.pop(0)
+					
+					self.last_frequencies.append(freq)
+					if len(self.last_frequencies) > self.max_frequency_history:
+						self.last_frequencies.pop(0)
+					
+					return CellularInfo(mcc, mnc, cell_id, lac, signal, band, freq)
+			return None
+		except Exception as e:
+			logger.error(f"Failed to get cellular info: {e}")
+			return None
+
+	def detect_frequency_hopping(self) -> bool:
+		"""Detect frequency hopping patterns typical of Stingray devices."""
+		if len(self.last_frequencies) < 3:
+			return False
+		
+		freq_changes = [abs(self.last_frequencies[i] - self.last_frequencies[i-1]) 
+					   for i in range(1, len(self.last_frequencies))]
+		
+		# check for stingray devices, stingrays often hop between frequencies rapidly
+		if any(change > 1000 for change in freq_changes):  
+			return True
+		
+		unique_freqs = len(set(self.last_frequencies))
+		if unique_freqs > len(self.last_frequencies) * 0.7: 
+			return True
+		
+		return False
+
+	def analyze_signal_patterns(self) -> Tuple[bool, List[str]]:
+		"""Analyze signal patterns for suspicious behavior."""
+		if len(self.signal_history) < 10:
+			return False, []
+		
+		reasons = []
+		suspicious = False
+		
+		signals = [s[1] for s in self.signal_history]
+		mean_signal = sum(signals) / len(signals)
+		variance = sum((s - mean_signal) ** 2 for s in signals) / len(signals)
+		
+		if variance > self.signal_variance_threshold:
+			suspicious = True
+			reasons.append("Unusual signal variance")
+		
+		if any(s > -30 for s in signals): 
+			suspicious = True
+			reasons.append("Abnormally strong signals detected")
+		
+		signal_changes = [abs(signals[i] - signals[i-1]) 
+						 for i in range(1, len(signals))]
+		if any(change > 20 for change in signal_changes):
+			suspicious = True
+			reasons.append("Rapid signal strength changes")
+		
+		return suspicious, reasons
+
+	def check_for_stingray(self) -> bool:
+		"""Check for potential Stingray device presence."""
+		try:
+			current_time = time.time()
+			if current_time - self.last_check < self.check_interval:
+				return False
+
+			cell_info = self.get_cellular_info()
+			if not cell_info:
+				return False
+
+			suspicious = False
+			reasons = []
+
+			if cell_info.signal_strength in range(-50, -30):
+				suspicious = True
+				reasons.append("Unusually strong signal")
+
+			if cell_info.cell_id in [0, 1, 65535]:
+				suspicious = True
+				reasons.append("Suspicious cell ID")
+
+			if cell_info.lac in [0, 65535]:
+				suspicious = True
+				reasons.append("Suspicious location area code")
+
+			freq_hopping = self.detect_frequency_hopping()
+			if freq_hopping:
+				suspicious = True
+				reasons.append("Frequency hopping detected")
+				self.frequency_hopping_detected = True
+
+			signal_suspicious, signal_reasons = self.analyze_signal_patterns()
+			if signal_suspicious:
+				suspicious = True
+				reasons.extend(signal_reasons)
+
+			operator_key = f"{cell_info.mcc}:{cell_info.mnc}"
+			if operator_key not in self.known_operators:
+				self.known_operators.add(operator_key)
+				if len(self.known_operators) > 2:  
+					suspicious = True
+					reasons.append("Multiple operator changes detected")
+
+			cell_key = f"{cell_info.mcc}:{cell_info.mnc}:{cell_info.cell_id}"
+			if cell_key in self.known_cells:
+				old_cell = self.known_cells[cell_key]
+				if abs(old_cell.signal_strength - cell_info.signal_strength) > 20:
+					suspicious = True
+					reasons.append("Rapid signal strength change")
+
+			self.known_cells[cell_key] = cell_info
+
+			if suspicious:
+				self.suspicious_events.append({
+					'timestamp': current_time,
+					'reasons': reasons,
+					'cell_info': cell_info,
+					'frequency_hopping': freq_hopping,
+					'signal_analysis': signal_reasons
+				})
+				
+				recent_events = [e for e in self.suspicious_events 
+							   if current_time - e['timestamp'] < 60]
+				if len(recent_events) >= self.alert_threshold:
+					logger.warning("Potential Stingray device detected!")
+					logger.warning(f"Reasons: {reasons}")
+					if freq_hopping:
+						logger.warning("Frequency hopping pattern detected!")
+					if signal_suspicious:
+						logger.warning("Suspicious signal patterns detected!")
+					return True
+
+			self.last_check = current_time
+			return False
+		except Exception as e:
+			logger.error(f"Stingray check failed: {e}")
+			return False
+
+	def enable_airplane_mode(self) -> bool:
+		"""Enable airplane mode to prevent cellular communication."""
+		try:
+			if CURRENT_PLATFORM.startswith("DARWIN"):
+				subprocess.run(["networksetup", "-setairportpower", "en0", "off"], check=True)
+				subprocess.run(["networksetup", "-setbluetoothpower", "off"], check=True)
+				subprocess.run(["networksetup", "-setwwanpowerstate", "off"], check=True)
+				subprocess.run(["defaults", "write", "/Library/Preferences/com.apple.locationd", "LocationServicesEnabled", "-bool", "false"], check=True)
+				subprocess.run(["killall", "locationd"], check=True)
+			return True
+		except Exception as e:
+			logger.error(f"Failed to enable airplane mode: {e}")
+			return False
+
+@dataclass
+class CellularInfo:
+	"""Represents cellular network information."""
+	mcc: int
+	mnc: int
+	cell_id: int
+	lac: int
+	signal_strength: int
+	band: str
+	frequency: int
+	timestamp: float = field(default_factory=time.time)
+
 @dataclass
 class Settings:
 	sleep_time: float
@@ -343,6 +762,21 @@ async def handle_usb_disconnect(settings: Settings) -> None:
 		logger.warning("USB disconnect detected! Initiating security measures...")
 		await lock_system()
 		
+		imse = IMSEProtection()
+		imse.protect_critical_memory()
+
+		if not imse.check_memory_integrity():
+			logger.warning("Memory integrity violation detected!")
+			suspicious = imse.scan_for_suspicious_patterns()
+			if suspicious:
+				logger.warning(f"Found suspicious memory patterns: {suspicious}")
+
+		# Check for Stingray
+		stingray = StingrayProtection()
+		if stingray.check_for_stingray():
+			logger.warning("Stingray device detected! Enabling airplane mode...")
+			stingray.enable_airplane_mode()
+
 		if settings.wipe_ram:
 			logger.info("Wiping RAM...")
 			for _ in range(settings.ram_wipe_passes):
@@ -899,7 +1333,7 @@ def main():
 	settings = Settings.from_config(config)
 	
 	if args.interval:
-		settings.check_interval = args.interval
+		settings.sleep_time = args.interval
 	if args.no_backup:
 		settings.do_backup = False
 	if args.no_monitor:
@@ -929,7 +1363,7 @@ def main():
 					logger.warning(f"Connections: {suspicious_connections}")
 					handle_security_breach(settings)
 			
-			time.sleep(settings.check_interval)
+			time.sleep(settings.sleep_time)
 			
 	except KeyboardInterrupt:
 		logger.info("Monitoring stopped by user")
