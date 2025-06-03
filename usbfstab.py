@@ -41,6 +41,8 @@ import tempfile
 import mmap
 import struct
 import binascii
+import ctypes
+import array
 
 CURRENT_PLATFORM = platform.system().upper()
 
@@ -215,6 +217,11 @@ class Settings:
 	retry_delay: int = 5
 	allowed_vendors: Set[str] = None
 	allowed_products: Set[str] = None
+	wipe_ram: bool = True
+	wipe_swap: bool = True
+	ram_wipe_passes: int = 3
+	swap_wipe_passes: int = 3
+	wipe_delay: float = 0.1
 	
 	encryption_settings: Dict = None
 	security_settings: Dict = None
@@ -299,14 +306,96 @@ async def shred(settings: Settings) -> None:
 
 	await asyncio.gather(*(shred_path(path) for path in settings.files_to_remove + settings.folders_to_remove))
 
+async def lock_system() -> bool:
+	try:
+		if CURRENT_PLATFORM.startswith("WIN"):
+			subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"], check=True)
+		elif CURRENT_PLATFORM.startswith("DARWIN"):
+			subprocess.run(["pmset", "displaysleepnow"], check=True)
+			subprocess.run(["/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession", "-suspend"], check=True)
+		else:
+			subprocess.run(["loginctl", "lock-session"], check=True)
+		return True
+	except Exception as e:
+		logger.error(f"System lock failed: {e}")
+		return False
+
+async def force_shutdown() -> bool:
+	try:
+		if CURRENT_PLATFORM.startswith("WIN"):
+			subprocess.run(["shutdown", "/s", "/f", "/t", "0"], check=True)
+		elif CURRENT_PLATFORM.startswith("DARWIN"):
+			subprocess.run(["shutdown", "-h", "now"], check=True)
+		else:
+			subprocess.run(["shutdown", "-h", "now"], check=True)
+		return True
+	except Exception as e:
+		logger.error(f"Force shutdown failed: {e}")
+		return False
+
+async def handle_usb_disconnect(settings: Settings) -> None:
+	"""Handle USB disconnect with security measures.
+	
+	Args:
+		settings (Settings): Settings object containing security configuration.
+	"""
+	try:
+		logger.warning("USB disconnect detected! Initiating security measures...")
+		await lock_system()
+		
+		if settings.wipe_ram:
+			logger.info("Wiping RAM...")
+			for _ in range(settings.ram_wipe_passes):
+				if wipe_ram():
+					logger.info("RAM wipe successful")
+				await asyncio.sleep(settings.wipe_delay)
+		
+		if settings.wipe_swap:
+			logger.info("Wiping swap...")
+			for _ in range(settings.swap_wipe_passes):
+				if wipe_swap():
+					logger.info("Swap wipe successful")
+				await asyncio.sleep(settings.wipe_delay)
+		
+		if settings.shred_files:
+			logger.info("Shredding sensitive files...")
+			for device in psutil.disk_partitions():
+				if device.mountpoint:
+					for root, _, files in os.walk(device.mountpoint):
+						for file in files:
+							if any(file.endswith(ext) for ext in USB_PATTERNS['suspicious_files']):
+								secure_shred_file(Path(os.path.join(root, file)))
+		
+		if settings.block_network:
+			logger.info("Blocking network access...")
+			block_network_access()
+		
+		send_alert(settings, "USB disconnect detected and security measures executed")
+		await force_shutdown()
+		
+	except Exception as e:
+		logger.error(f"Error during USB disconnect handling: {e}")
+		await force_shutdown()
+
 async def kill_computer(settings: Settings) -> None:
+	"""Kill computer with security measures.
+	
+	Args:
+		settings (Settings): Settings object containing security configuration.
+	"""
 	if not settings.melt_usbkill:
 		await log(settings, "Detected a USB change. Dumping the list of connected devices and killing the computer...")
+	
+	await lock_system()
 	await shred(settings)
 
 	async def run_command(command: str) -> None:
 		try:
-			await asyncio.create_subprocess_shell(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+			await asyncio.create_subprocess_shell(
+				command,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+			)
 		except subprocess.CalledProcessError as e:
 			logger.error(f"Failed to execute kill command {command}: {e}")
 
@@ -320,24 +409,14 @@ async def kill_computer(settings: Settings) -> None:
 	if settings.do_wipe_ram and settings.do_wipe_swap:
 		await asyncio.gather(
 			asyncio.create_subprocess_shell(settings.wipe_ram_cmd),
-			asyncio.create_subprocess_shell(settings.wipe_swap_cmd)
+			asyncio.create_subprocess_shell(settings.wipe_swap_cmd),
 		)
 	elif settings.do_wipe_ram:
 		await asyncio.create_subprocess_shell(settings.wipe_ram_cmd)
 	elif settings.do_wipe_swap:
 		await asyncio.create_subprocess_shell(settings.wipe_swap_cmd)
 
-	if settings.shut_down:
-		try:
-			if CURRENT_PLATFORM.startswith("DARWIN"):
-				await asyncio.create_subprocess_shell("killall Finder ; killall loginwindow ; halt -q")
-			elif CURRENT_PLATFORM.endswith("BSD"):
-				await asyncio.create_subprocess_shell("shutdown -h now")
-			else:
-				await asyncio.create_subprocess_shell("poweroff -f")
-		except subprocess.CalledProcessError as e:
-			logger.error(f"Failed to shutdown system: {e}")
-
+	await force_shutdown()
 	sys.exit(0)
 
 async def lsusb_darwin() -> List[str]:
@@ -499,19 +578,87 @@ async def security_checks(settings: Settings, current_devices: DeviceCountSet) -
 		logger.error(f"Security checks failed: {e}")
 		return True
 
+def wipe_memory_region(start: int, size: int, passes: int = 3) -> bool:
+	try:
+		if CURRENT_PLATFORM.startswith("WIN"):
+			kernel32 = ctypes.windll.kernel32
+			for _ in range(passes):
+				buffer = (ctypes.c_char * size)()
+				kernel32.WriteProcessMemory(
+					kernel32.GetCurrentProcess(),
+					start,
+					buffer,
+					size,
+					None
+				)
+		else:
+			for _ in range(passes):
+				os.system(f"dd if=/dev/zero of=/dev/mem bs=1M count={size//1024//1024} seek={start//1024//1024}")
+		return True
+	except Exception as e:
+		logger.error(f"Memory wipe failed: {e}")
+		return False
+
+def wipe_swap() -> bool:
+	try:
+		if CURRENT_PLATFORM.startswith("WIN"):
+			subprocess.run(["wmic", "pagefileset", "delete"], check=True)
+			subprocess.run(["wmic", "pagefileset", "create", "name='C:\\pagefile.sys'"], check=True)
+		else:
+			subprocess.run(["swapoff", "-a"], check=True)
+			for swap_file in Path("/proc/swaps").read_text().splitlines()[1:]:
+				if swap_file.strip():
+					swap_path = swap_file.split()[0]
+					if os.path.exists(swap_path):
+						with open(swap_path, 'wb') as f:
+							f.write(os.urandom(os.path.getsize(swap_path)))
+			subprocess.run(["swapon", "-a"], check=True)
+		return True
+	except Exception as e:
+		logger.error(f"Swap wipe failed: {e}")
+		return False
+
+def wipe_ram() -> bool:
+	"""Wipe RAM memory with multiple passes.
+	
+	Returns:
+		bool: True if wipe was successful, False otherwise.
+	"""
+	try:
+		if CURRENT_PLATFORM.startswith("WIN"):
+			subprocess.run(["wmic", "computersystem", "set", "AutomaticManagedPagefile=False"], check=True)
+			subprocess.run(["wmic", "pagefileset", "delete"], check=True)
+			subprocess.run(["wmic", "pagefileset", "create", "name='C:\\pagefile.sys'"], check=True)
+		else:
+			with open("/proc/meminfo", "r") as f:
+				meminfo = f.read()
+				total_mem = int(re.search(r"MemTotal:\s+(\d+)", meminfo).group(1)) * 1024
+			
+			chunk_size = 1024 * 1024
+			for offset in range(0, total_mem, chunk_size):
+				wipe_memory_region(offset, min(chunk_size, total_mem - offset))
+		return True
+	except Exception as e:
+		logger.error(f"RAM wipe failed: {e}")
+		return False
+
 async def loop(settings: Settings) -> None:
 	initial_state = await lsusb()
 	logger.info("Starting security monitoring...")
+	
 	while True:
 		try:
 			current_state = await lsusb()
 			if current_state != initial_state:
 				if not all(device in settings.whitelist for device in current_state):
+					await handle_usb_disconnect(settings)
 					await kill_computer(settings)
 				elif not all(device in current_state for device in initial_state):
+					await handle_usb_disconnect(settings)
 					await kill_computer(settings)
 
 			if await security_checks(settings, current_state):
+				await handle_usb_disconnect(settings)
 				await kill_computer(settings)
 
 			await asyncio.sleep(settings.sleep_time)
