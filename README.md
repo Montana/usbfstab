@@ -1,6 +1,6 @@
 # usbfstab
 
-![Blue Corporate Medical Logo  (5)](https://github.com/user-attachments/assets/5e24bf36-29ac-48ff-ae4e-a4251731b831)
+![Blue Corporate Medical Logo  (6)](https://github.com/user-attachments/assets/eb17300f-8ef7-4ff0-97b5-61bbb0397e50)
 
 **usbfstab** (usbfilesystemtable) is an anti-forensic USB defense tool that continuously monitors connected USB devices and enforces a system kill-switch upon detection of unauthorized hardware changes. Inspiration by `usbkill`. You can use the `setup.sh` script if this seems too complicated, make sure you `chmod +x setup.sh` then run `./setup.sh`. 
 
